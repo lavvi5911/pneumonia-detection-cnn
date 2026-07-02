@@ -11,6 +11,7 @@ import streamlit as st
 import tensorflow as tf
 
 import config
+from src import model_builder  # noqa: F401  (import registers custom Keras layers used by saved models)
 
 
 def inject_global_css():
