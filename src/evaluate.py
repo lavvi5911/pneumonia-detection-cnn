@@ -31,7 +31,7 @@ from sklearn.metrics import (
 )
 
 import config
-from src import data_loader, utils
+from src import data_loader, model_builder, utils  # model_builder import registers custom Keras layers used by saved models
 
 PALETTE = {"bg": "#0B1F3A", "accent": "#14B8A6", "warn": "#F97316", "grid": "#1E3A5F"}
 
