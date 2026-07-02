@@ -20,6 +20,16 @@ from tensorflow.keras import layers, regularizers, Model
 
 import config
 
+# `tf.keras.saving.register_keras_serializable` isn't reliably populated on the
+# lazy-loaded `tf.keras` alias across all TF/Keras versions. The standalone
+# `keras` package (bundled with TF 2.16+) exposes it consistently, so we prefer
+# that and fall back to the older `tf.keras.utils` location for older TF builds.
+try:
+    import keras as _keras
+    register_keras_serializable = _keras.saving.register_keras_serializable
+except (ImportError, AttributeError):
+    register_keras_serializable = tf.keras.utils.register_keras_serializable
+
 
 # ------------------------------------------------------------------
 # Building blocks
@@ -122,11 +132,48 @@ _BACKBONE_FACTORY = {
     ),
 }
 
-_PREPROCESS_FACTORY = {
-    "efficientnet": tf.keras.applications.efficientnet.preprocess_input,
-    "densenet": tf.keras.applications.densenet.preprocess_input,
-    "resnet": tf.keras.applications.resnet_v2.preprocess_input,
+_PREPROCESS_MODE = {
+    "efficientnet": "efficientnet",  # EfficientNet's Keras impl normalizes internally (no-op here)
+    "densenet": "torch",             # scale to [0,1] then normalize by ImageNet mean/std
+    "resnet": "tf",                  # scale to [-1, 1]
 }
+
+
+@register_keras_serializable(package="pulmovision", name="BackbonePreprocess")
+class BackbonePreprocess(layers.Layer):
+    """Self-contained, serializable replacement for wrapping a library
+    `preprocess_input` function in a `Lambda` layer.
+
+    Wrapping an external function (e.g. `tf.keras.applications.efficientnet.
+    preprocess_input`) in `Lambda` fails to reload from a saved .keras file on
+    some Keras versions, because Keras can't always resolve where that function
+    lives at load time. Reimplementing the (very simple) preprocessing formulas
+    directly in a registered custom layer avoids that failure mode entirely —
+    the layer is decorated with `register_keras_serializable`, so `load_model`
+    can always reconstruct it as long as this module has been imported.
+    """
+
+    def __init__(self, mode: str, **kwargs):
+        super().__init__(**kwargs)
+        if mode not in ("efficientnet", "torch", "tf"):
+            raise ValueError(f"Unknown preprocess mode '{mode}'")
+        self.mode = mode
+        # ImageNet channel mean/std (RGB), expressed in [0, 255] pixel range, for "torch" mode.
+        self._mean = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32) * 255.0
+        self._std = tf.constant([0.229, 0.224, 0.225], dtype=tf.float32) * 255.0
+
+    def call(self, inputs):
+        x = tf.cast(inputs, tf.float32)
+        if self.mode == "efficientnet":
+            return x
+        if self.mode == "torch":
+            return (x - self._mean) / self._std
+        return (x / 127.5) - 1.0  # "tf" mode (ResNetV2)
+
+    def get_config(self):
+        config_dict = super().get_config()
+        config_dict.update({"mode": self.mode})
+        return config_dict
 
 
 def build_transfer_model(
@@ -137,7 +184,7 @@ def build_transfer_model(
     """ImageNet-pretrained backbone + custom dense head for binary classification.
 
     Our tf.data pipeline already scales images to [0, 1]; we therefore feed the
-    backbone-specific `preprocess_input` inside the graph so a single SavedModel
+    backbone-specific preprocessing inside the graph so a single SavedModel
     stays self-contained (no separate preprocessing step needed at inference time).
     """
     if architecture not in _BACKBONE_FACTORY:
@@ -145,7 +192,7 @@ def build_transfer_model(
 
     inputs = layers.Input(shape=input_shape, name="input_image")
     x = layers.Rescaling(255.0, name="to_0_255")(inputs)  # undo the [0,1] scaling from data_loader
-    x = layers.Lambda(_PREPROCESS_FACTORY[architecture], name="backbone_preprocess")(x)
+    x = BackbonePreprocess(mode=_PREPROCESS_MODE[architecture], name="backbone_preprocess")(x)
 
     backbone = _BACKBONE_FACTORY[architecture](input_shape)
     backbone._name = f"{architecture}_backbone"
